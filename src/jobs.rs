@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex};
 use crate::analyze::{self, Plan};
 use crate::extract;
 use crate::game;
-use crate::install::Db;
+use crate::install::{Clash, Db};
+use crate::net;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum State {
@@ -25,6 +26,8 @@ pub struct Job {
     pub state: State,
     pub plan: Option<Plan>,
     pub notes: Vec<String>,
+    /// Other mods this would replace files of.
+    pub clashes: Vec<Clash>,
     /// Staging folder to delete once done (None for dropped folders).
     staging: Option<PathBuf>,
 }
@@ -39,6 +42,10 @@ impl Job {
 pub struct Shared {
     pub jobs: Vec<Job>,
     pub log: Vec<String>,
+    /// What's being switched or downloaded right now.
+    pub busy: Option<String>,
+    /// A newer version of this app: (version, download).
+    pub update: Option<(String, String)>,
     next: usize,
 }
 
@@ -88,18 +95,25 @@ impl Jobs {
             let mut s = self.shared.lock().unwrap();
             s.next += 1;
             let id = s.next;
-            s.jobs.insert(0, Job { id, source: source.clone(), state: State::Reading, plan: None, notes: Vec::new(), staging: None });
+            s.jobs.insert(0, Job { id, source: source.clone(), state: State::Reading, plan: None, notes: Vec::new(), clashes: Vec::new(), staging: None });
             id
         };
         (self.repaint)();
         let this = self.clone();
         std::thread::spawn(move || {
             let result = prepare(&source, id);
+            let clashes = match (&result, &game) {
+                (Ok((plan, _)), Some(g)) => this.db.lock().unwrap().clashes(g, plan),
+                _ => Vec::new(),
+            };
             let mut ready = false;
             this.with_job(id, |job| match result {
                 Ok((plan, staging)) => {
                     job.staging = staging;
-                    ready = auto && !plan.needs_decision();
+                    // Replacing another mod's files (not just shared libraries) is worth a look first.
+                    let replaces_mod = clashes.iter().any(|c| !c.name.is_empty() && !c.libraries_only);
+                    ready = auto && !plan.needs_decision() && !replaces_mod;
+                    job.clashes = clashes;
                     job.plan = Some(plan);
                     job.state = State::Ready;
                 }
@@ -125,7 +139,7 @@ impl Jobs {
             let outcome = if game::running() {
                 Err("Close GTA V and RAGE Plugin Hook first, the game locks its files while it runs.".to_string())
             } else {
-                this.db.lock().unwrap().install(&game, &plan, &source)
+                this.db.lock().unwrap().install(&game, &plan, &source, game::is_core(&plan))
             };
             let line = match &outcome {
                 Ok((m, _)) => format!("Installed {}: {} files", plan.name, m.files.len()),
@@ -163,7 +177,7 @@ impl Jobs {
         let this = self.clone();
         std::thread::spawn(move || {
             let parts = extra.parts.iter().map(|p| (p.kind, p.actions.as_slice()));
-            let outcome = this.db.lock().unwrap().add(&game, &name, &source, parts, Vec::new());
+            let outcome = this.db.lock().unwrap().add(&game, &name, &source, parts, Vec::new(), None);
             match outcome {
                 Ok((_, notes)) => {
                     this.log(format!("Added {} to {name}", extra.label));
@@ -197,6 +211,85 @@ impl Jobs {
             job.state = State::Ready;
             job.notes.clear();
         }
+    }
+
+    /// Runs a database change that moves files (switching mods, profiles,
+    /// the clean game) in the background, then logs `done` and any files
+    /// that couldn't be moved.
+    pub fn switch(&self, busy: impl Into<String>, done: impl Into<String>, f: impl FnOnce(&mut Db) -> Result<Vec<String>, String> + Send + 'static) {
+        if game::running() {
+            return self.log("Close GTA V and RAGE Plugin Hook first, the game locks its files while it runs.");
+        }
+        {
+            let mut s = self.shared.lock().unwrap();
+            if s.busy.is_some() {
+                return;
+            }
+            s.busy = Some(busy.into());
+        }
+        let (this, done) = (self.clone(), done.into());
+        std::thread::spawn(move || {
+            let result = f(&mut this.db.lock().unwrap());
+            match result {
+                Ok(problems) => {
+                    this.log(done);
+                    for p in problems {
+                        this.log(format!("  Couldn't move {p}"));
+                    }
+                }
+                Err(e) => this.log(format!("Failed: {e}")),
+            }
+            this.shared.lock().unwrap().busy = None;
+            (this.repaint)();
+        });
+    }
+
+    /// Downloads a GitHub release file and installs it like a drop.
+    pub fn fetch(&self, repo: &'static str, asset: &'static str, game: Option<PathBuf>) {
+        {
+            let mut s = self.shared.lock().unwrap();
+            if s.busy.is_some() {
+                return;
+            }
+            s.busy = Some(format!("Downloading {asset}..."));
+        }
+        (self.repaint)();
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let dir = staging_root().join(format!("download-{}", std::process::id())).join(repo.replace('/', "-"));
+            let result = net::fetch(repo, asset, &dir);
+            this.shared.lock().unwrap().busy = None;
+            match result {
+                Ok(file) => {
+                    this.log(format!("Downloaded {asset} from github.com/{repo}"));
+                    let auto = game.is_some();
+                    this.add(file, game, auto);
+                }
+                Err(e) => this.log(format!("Couldn't download {asset}: {e}")),
+            }
+        });
+    }
+
+    /// Looks for a newer version of this app.
+    pub fn check_update(&self) {
+        let this = self.clone();
+        std::thread::spawn(move || {
+            if let Some(update) = net::update_available() {
+                this.shared.lock().unwrap().update = Some(update);
+                (this.repaint)();
+            }
+        });
+    }
+
+    pub fn update(&self, url: String) {
+        self.shared.lock().unwrap().busy = Some("Downloading the update...".into());
+        let this = self.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = net::update(&url) {
+                this.shared.lock().unwrap().busy = None;
+                this.log(format!("Couldn't update: {e}"));
+            }
+        });
     }
 
     pub fn dismiss(&self, id: usize) {

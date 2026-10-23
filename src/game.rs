@@ -138,18 +138,20 @@ pub struct Prereq {
     pub what: &'static str,
     pub url: &'static str,
     pub essential: bool,
+    /// (GitHub repo, release file) for a one-click install.
+    pub github: Option<(&'static str, &'static str)>,
 }
 
 pub const PREREQS: &[Prereq] = &[
-    Prereq { need: Need::Rph, name: "RAGE Plugin Hook", what: "Runs LSPDFR and its plugins. Comes with LSPDFR.", url: "https://ragepluginhook.net/", essential: true },
-    Prereq { need: Need::Lspdfr, name: "LSPDFR", what: "The police mod itself.", url: "https://www.lcpdfr.com/downloads/gta5mods/g17media/7792-lspd-first-response/", essential: true },
-    Prereq { need: Need::RageNativeUi, name: "RAGENativeUI", what: "Menus used by most LSPDFR plugins.", url: "https://github.com/alexguirre/RAGENativeUI/releases", essential: true },
-    Prereq { need: Need::Lml, name: "Lenny's Mod Loader", what: "Loads cars and other add-ons without editing game archives.", url: "https://www.lcpdfr.com/downloads/gta5mods/misc/25437-lennys-mod-loader/", essential: true },
-    Prereq { need: Need::ScriptHookV, name: "Script Hook V", what: "Needed for .asi mods and .NET scripts.", url: "http://www.dev-c.com/gtav/scripthookv/", essential: false },
-    Prereq { need: Need::AsiLoader, name: "ASI Loader (dinput8.dll)", what: "Loads .asi mods. Comes with Script Hook V.", url: "http://www.dev-c.com/gtav/scripthookv/", essential: false },
-    Prereq { need: Need::Shvdn, name: "Script Hook V .NET", what: "Runs scripts in the scripts folder.", url: "https://github.com/scripthookvdotnet/scripthookvdotnet/releases", essential: false },
-    Prereq { need: Need::OpenIvAsi, name: "OpenIV.asi", what: "Lets the game read unencrypted DLC packs and the mods folder.", url: "https://openiv.com/", essential: false },
-    Prereq { need: Need::Els, name: "Emergency Lighting System", what: "Needed by cars that come with an ELS .xml.", url: "https://www.lcpdfr.com/search/?q=Emergency%20Lighting%20System&type=downloads_file", essential: false },
+    Prereq { need: Need::Rph, name: "RAGE Plugin Hook", what: "Runs LSPDFR and its plugins. Comes with LSPDFR.", url: "https://ragepluginhook.net/", essential: true, github: None },
+    Prereq { need: Need::Lspdfr, name: "LSPDFR", what: "The police mod itself.", url: "https://www.lcpdfr.com/downloads/gta5mods/g17media/7792-lspd-first-response/", essential: true, github: None },
+    Prereq { need: Need::RageNativeUi, name: "RAGENativeUI", what: "Menus used by most LSPDFR plugins.", url: "https://github.com/alexguirre/RAGENativeUI/releases", essential: true, github: Some(("alexguirre/RAGENativeUI", "RAGENativeUI.zip")) },
+    Prereq { need: Need::Lml, name: "Lenny's Mod Loader", what: "Loads cars and other add-ons without editing game archives.", url: "https://www.lcpdfr.com/downloads/gta5mods/misc/25437-lennys-mod-loader/", essential: true, github: None },
+    Prereq { need: Need::ScriptHookV, name: "Script Hook V", what: "Needed for .asi mods and .NET scripts.", url: "http://www.dev-c.com/gtav/scripthookv/", essential: false, github: None },
+    Prereq { need: Need::AsiLoader, name: "ASI Loader (dinput8.dll)", what: "Loads .asi mods. Comes with Script Hook V.", url: "https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases", essential: false, github: Some(("ThirteenAG/Ultimate-ASI-Loader", "Ultimate-ASI-Loader_x64.zip")) },
+    Prereq { need: Need::Shvdn, name: "Script Hook V .NET", what: "Runs scripts in the scripts folder.", url: "https://github.com/scripthookvdotnet/scripthookvdotnet/releases", essential: false, github: Some(("scripthookvdotnet/scripthookvdotnet", "ScriptHookVDotNet.zip")) },
+    Prereq { need: Need::OpenIvAsi, name: "OpenIV.asi", what: "Lets the game read unencrypted DLC packs and the mods folder.", url: "https://openiv.com/", essential: false, github: None },
+    Prereq { need: Need::Els, name: "Emergency Lighting System", what: "Needed by cars that come with an ELS .xml.", url: "https://www.lcpdfr.com/search/?q=Emergency%20Lighting%20System&type=downloads_file", essential: false, github: None },
 ];
 
 pub fn has(game: &Path, need: Need) -> bool {
@@ -183,6 +185,32 @@ pub fn needs(kind: Kind) -> &'static [Need] {
 
 pub fn prereq(need: Need) -> &'static Prereq {
     PREREQS.iter().find(|p| p.need == need).expect("every need is listed")
+}
+
+/// True when the mod itself brings this essential (e.g. LSPDFR brings RPH).
+pub fn provides(plan: &crate::analyze::Plan, need: Need) -> bool {
+    let file = match need {
+        Need::Rph => "ragepluginhook.exe",
+        Need::Lspdfr => "lspd first response.dll",
+        Need::ScriptHookV => "scripthookv.dll",
+        Need::AsiLoader => "dinput8.dll",
+        Need::Shvdn => "scripthookvdotnet.asi",
+        Need::Lml => "vfs.dll",
+        Need::OpenIvAsi => "openiv.asi",
+        Need::Els => "els.asi",
+        Need::RageNativeUi => "ragenativeui.dll",
+    };
+    plan.parts().flat_map(|p| &p.actions).any(|a| a.to().file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(file)))
+}
+
+/// Something every profile needs: one of the essentials, or only libraries.
+pub fn is_core(plan: &crate::analyze::Plan) -> bool {
+    PREREQS.iter().any(|p| provides(plan, p.need)) || plan.kinds().iter().all(|k| *k == Kind::Library)
+}
+
+/// Starts LSPDFR through RAGE Plugin Hook.
+pub fn launch(game: &Path) -> Result<(), String> {
+    std::process::Command::new(game.join("RAGEPluginHook.exe")).current_dir(game).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

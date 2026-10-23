@@ -123,6 +123,40 @@ pub fn root(name: &str) -> PathBuf {
     PathBuf::from("lml").join(folder_name(name))
 }
 
+/// The names to spawn a car mod's cars with: the `<modelName>`s in its
+/// vehicles.meta files, or else its model file names.
+pub fn spawn_names(files: &[PathBuf]) -> Vec<String> {
+    let mut names = Vec::new();
+    for f in files.iter().filter(|f| f.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase().ends_with("vehicles.meta"))) {
+        let Ok(text) = std::fs::read_to_string(f) else { continue };
+        names.extend(model_names(&text));
+    }
+    if names.is_empty() {
+        for f in files.iter().filter(|f| crate::extract::ext(f) == "yft") {
+            let stem = f.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+            if !stem.ends_with("_hi") && !stem.is_empty() {
+                names.push(stem);
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    names.retain(|n| seen.insert(n.to_lowercase()));
+    names
+}
+
+pub fn model_names(meta: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = meta;
+    while let Some(i) = rest.find("<modelName>") {
+        rest = &rest[i + "<modelName>".len()..];
+        let name = rest.split('<').next().unwrap_or("").trim();
+        if !name.is_empty() {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +180,13 @@ mod tests {
         assert!(xml.contains("<Name>Police &amp; Co</Name>"));
         assert!(xml.contains("<StreamingFiles>stream</StreamingFiles>"));
         assert!(xml.contains("<DataFile type=\"VEHICLE_METADATA_FILE\">data/vehicles.meta</DataFile>"));
+    }
+
+    #[test]
+    fn finds_spawn_names() {
+        let meta = "<CVehicleModelInfo__InitDataList>\n<InitDatas>\n<Item>\n<modelName>police5</modelName>\n<txdName>police5</txdName>\n</Item>\n<Item><modelName> fpiu20 </modelName></Item>";
+        assert_eq!(model_names(meta), ["police5", "fpiu20"]);
+        assert_eq!(spawn_names(&[PathBuf::from("x/police9.yft"), PathBuf::from("x/police9_hi.yft"), PathBuf::from("x/police9.ytd")]), ["police9"]);
     }
 
     #[test]

@@ -122,4 +122,20 @@ mod tests {
         assert_eq!(inside(root, Path::new(r"C:\Windows\evil.dll")), None);
         assert_eq!(inside(root, Path::new("")), None);
     }
+
+    #[test]
+    fn unpacks_7z() {
+        let root = std::env::temp_dir().join(format!("lspdfr-7z-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src").join("Callouts");
+        std::fs::create_dir_all(src.join("plugins").join("LSPDFR")).unwrap();
+        std::fs::write(src.join("plugins").join("LSPDFR").join("Callouts.dll"), "MZ").unwrap();
+        let archive = root.join("callouts.7z");
+        sevenz_rust2::compress_to_path(root.join("src"), &archive).unwrap();
+        unpack(&archive, &root.join("out")).unwrap();
+        let found: Vec<_> = walkdir::WalkDir::new(root.join("out")).into_iter().flatten().filter(|e| e.file_name() == "Callouts.dll").collect();
+        assert_eq!(found.len(), 1);
+        assert_eq!(std::fs::read(found[0].path()).unwrap(), b"MZ");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

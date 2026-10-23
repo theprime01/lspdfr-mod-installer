@@ -8,11 +8,13 @@ pub struct Settings {
     pub game: Option<PathBuf>,
     /// Install as soon as a drop is read, unless there's a choice to make.
     pub auto_install: bool,
+    /// The game build last seen, to notice GTA updates.
+    pub known_build: Option<u32>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { game: None, auto_install: true }
+        Settings { game: None, auto_install: true, known_build: None }
     }
 }
 

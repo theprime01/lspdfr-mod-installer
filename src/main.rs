@@ -1,12 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod analyze;
+mod crash;
 mod dotnet;
 mod extract;
 mod game;
 mod install;
 mod jobs;
 mod lml;
+mod net;
 mod settings;
 mod ui;
 
@@ -19,6 +21,7 @@ fn main() -> eframe::Result<()> {
             return Ok(());
         }
     }
+    net::clean_up();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("LSPDFR Mod Installer")
