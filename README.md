@@ -40,3 +40,7 @@ cargo build --release   # target\release\lspdfr-mod-installer.exe
 `lspdfr-mod-installer.exe --plan <zip or folder>` prints where everything would go, without installing (debug build, from a console).
 
 The game folder is found from the Rockstar launcher, Steam and Epic, or chosen with **Change...**. Settings and the installed-mods list are in `%APPDATA%\LSPDFR Mod Installer`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
