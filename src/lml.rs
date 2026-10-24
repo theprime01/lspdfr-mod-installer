@@ -75,6 +75,9 @@ pub enum Package {
     Replace,
     /// A packed DLC.
     DlcRpf,
+    /// EUP add-on clothing in `stream\<clothing set>\`, loaded after EUP so
+    /// its files win.
+    Clothing,
 }
 
 pub fn install_xml(name: &str, package: &Package) -> String {
@@ -101,6 +104,11 @@ pub fn install_xml(name: &str, package: &Package) -> String {
         }
         Package::DlcRpf => {
             format!("    <Addons>\n        <Addon name=\"{name}\">\n            <DlcRpf>dlc.rpf</DlcRpf>\n        </Addon>\n    </Addons>\n")
+        }
+        // An extension goes last in mods.xml, and LML gives streamed files
+        // to the last mod in the load order.
+        Package::Clothing => {
+            format!("    <IsExtension>true</IsExtension>\n    <Addons>\n        <Addon name=\"{name}\">\n            <StreamingFiles subFolderGamePath=\"true\">stream</StreamingFiles>\n        </Addon>\n    </Addons>\n")
         }
     };
     format!(

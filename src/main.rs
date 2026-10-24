@@ -3,6 +3,7 @@
 mod analyze;
 mod crash;
 mod dotnet;
+mod eup;
 mod extract;
 mod game;
 mod install;
@@ -49,6 +50,9 @@ fn print_plan(source: &std::path::Path) {
     };
     let plan = analyze::analyze(&root, &name);
     println!("{} (exclusive: {}, needs decision: {})", plan.name, plan.exclusive, plan.needs_decision());
+    for w in &plan.warnings {
+        println!("! {w}");
+    }
     for set in &plan.sets {
         println!("[{}] {}", if set.selected { "x" } else { " " }, set.label);
         for part in &set.parts {

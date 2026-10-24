@@ -18,6 +18,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::analyze::{Action, Kind, Plan};
+use crate::eup;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileRec {
@@ -73,6 +74,9 @@ pub struct GameState {
     pub active: Option<String>,
     /// While the clean game is on: the mods that were on before.
     pub clean: Option<Vec<u64>>,
+    /// Plugins whose LoadPlugin line in startup.rphs this app added.
+    #[serde(default)]
+    pub startup: Vec<String>,
 }
 
 /// Another mod (or a file already there) that an install would replace.
@@ -205,7 +209,13 @@ impl Db {
                         notes.push(format!("Left out {}: a folder is in the way", rel.display()));
                         continue;
                     }
-                    let backup = if dest.is_file() && !files.iter().any(|f| same(&f.path, rel)) {
+                    if let Action::Copy { from, .. } = action {
+                        if let Some((have, new)) = newer_already(&dest, from) {
+                            notes.push(format!("Kept {} {have}: it's newer than the {new} this mod comes with.", rel.display()));
+                            continue;
+                        }
+                    }
+                    let backup =if dest.is_file() && !files.iter().any(|f| same(&f.path, rel)) {
                         let b = backups.join(rel);
                         fs::create_dir_all(b.parent().unwrap()).map_err(|e| e.to_string())?;
                         fs::copy(&dest, &b).map_err(|e| format!("backing up {}: {e}", rel.display()))?;
@@ -261,6 +271,10 @@ impl Db {
         if self.mods[index].is_car() {
             self.mods[index].models = spawn_names(&self.mods[index]);
         }
+        match self.refresh(game) {
+            Ok(added) => notes.extend(added),
+            Err(e) => notes.push(e),
+        }
         self.save()?;
         Ok((self.mods[index].clone(), notes))
     }
@@ -301,17 +315,22 @@ impl Db {
         }
         let _ = fs::remove_dir_all(backups.join(id.to_string()));
         self.mods.retain(|x| x.id != id);
+        // The mod is gone either way; a stale LoadPlugin line only prints
+        // an error in the RPH console.
+        let _ = self.refresh(&m.game);
         self.save()
     }
 
     /// Switches a mod on or off. Returns files that couldn't be moved.
     pub fn set_enabled(&mut self, id: u64, on: bool) -> Result<Vec<String>, String> {
         let Some(index) = self.mods.iter().position(|m| m.id == id) else { return Ok(Vec::new()) };
-        let problems = match (self.mods[index].enabled, on) {
+        let mut problems = match (self.mods[index].enabled, on) {
             (true, false) => self.switch_off(index),
             (false, true) => self.switch_on(index),
             _ => Vec::new(),
         };
+        let game = self.mods[index].game.clone();
+        problems.extend(self.refresh(&game).err());
         self.save()?;
         Ok(problems)
     }
@@ -442,7 +461,8 @@ impl Db {
         let state = self.state_mut(game);
         state.clean = None;
         state.active = profile.clone();
-        let problems = self.sync(game, |m| m.in_profile(profile.as_deref()));
+        let mut problems = self.sync(game, |m| m.in_profile(profile.as_deref()));
+        problems.extend(self.refresh(game).err());
         self.save()?;
         Ok(problems)
     }
@@ -451,7 +471,7 @@ impl Db {
     /// mods that were on.
     pub fn set_clean(&mut self, game: &Path, on: bool) -> Result<Vec<String>, String> {
         let state = self.state(game);
-        let problems = match (state.clean, on) {
+        let mut problems = match (state.clean, on) {
             (None, true) => {
                 let was_on: Vec<u64> = self.mods.iter().filter(|m| same(&m.game, game) && m.enabled).map(|m| m.id).collect();
                 self.state_mut(game).clean = Some(was_on);
@@ -469,8 +489,75 @@ impl Db {
             }
             _ => Vec::new(),
         };
+        problems.extend(self.refresh(game).err());
         self.save()?;
         Ok(problems)
+    }
+
+    /// Makes startup.rphs load the RAGE Plugin Hook plugins of the mods
+    /// that are on. Only lines this app added are ever taken out. Returns
+    /// the plugins it added.
+    fn refresh_startup(&mut self, game: &Path) -> Result<Vec<String>, String> {
+        let mut wanted: Vec<String> = Vec::new();
+        for m in self.mods.iter().filter(|m| m.enabled && same(&m.game, game)) {
+            for f in m.files.iter().filter(|f| is_rph_plugin(game, &f.path)) {
+                let name = f.path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                if !wanted.iter().any(|w| w.eq_ignore_ascii_case(&name)) {
+                    wanted.push(name);
+                }
+            }
+        }
+        let owned = self.state(game).startup;
+        let path = game.join(STARTUP);
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let (new_text, new_owned) = startup_lines(&text, &wanted, &owned);
+        if new_text != text {
+            fs::write(&path, &new_text).map_err(|e| format!("Couldn't update {STARTUP}: {e}"))?;
+        }
+        let added = new_owned.iter().filter(|p| !owned.iter().any(|o| o.eq_ignore_ascii_case(p))).cloned().collect();
+        if new_owned != owned {
+            self.state_mut(game).startup = new_owned;
+        }
+        Ok(added)
+    }
+
+    /// The shared files that follow which mods are on: startup.rphs and EUP
+    /// Menu's preset outfits. Returns notes about what was added.
+    fn refresh(&mut self, game: &Path) -> Result<Vec<String>, String> {
+        let mut notes: Vec<String> = self.refresh_startup(game)?.iter().map(|p| format!("RAGE Plugin Hook will load {p} when the game starts (added to {STARTUP}).")).collect();
+        notes.extend(self.refresh_presets(game)?.iter().map(|a| format!("EUP Menu has a {a} section now (press its key in game, then EUP).")));
+        Ok(notes)
+    }
+
+    /// Puts the outfits of the EUP add-on packs that are on into
+    /// presetoutfits.ini, each in its own marked block, and takes out the
+    /// blocks of packs that aren't. Returns the packs it added.
+    fn refresh_presets(&mut self, game: &Path) -> Result<Vec<String>, String> {
+        let packs_dir = Path::new(eup::PACKS);
+        let mut packs: Vec<(String, String)> = Vec::new();
+        for m in self.mods.iter().filter(|m| m.enabled && same(&m.game, game)) {
+            for f in m.files.iter().filter(|f| f.path.parent().is_some_and(|p| same(p, packs_dir))) {
+                if let Ok(text) = fs::read_to_string(game.join(&f.path)) {
+                    packs.push((f.path.file_stem().unwrap_or_default().to_string_lossy().into_owned(), text));
+                }
+            }
+        }
+        let path = game.join(eup::PRESETS);
+        let Ok(text) = fs::read_to_string(&path) else {
+            if packs.is_empty() {
+                return Ok(Vec::new());
+            }
+            return Err(format!("EUP Menu's preset outfits ({}) aren't there yet, so this pack's outfits wait. Install EUP Law & Order, then switch this mod off and on.", eup::PRESETS));
+        };
+        let marker = |p: &str| format!("// >>> LSPDFR Mod Installer: {p}");
+        if packs.is_empty() && !text.contains("// >>> LSPDFR Mod Installer: ") {
+            return Ok(Vec::new());
+        }
+        let new_text = eup::presets_with(&text, &packs);
+        if new_text != text {
+            fs::write(&path, &new_text).map_err(|e| format!("Couldn't update {}: {e}", eup::PRESETS))?;
+        }
+        Ok(packs.into_iter().map(|(p, _)| p).filter(|p| !text.contains(&marker(p))).collect())
     }
 
     pub fn add_profile(&mut self, game: &Path, name: &str) -> Result<(), String> {
@@ -625,6 +712,66 @@ pub fn protected(rel: &Path) -> Option<&'static str> {
     None
 }
 
+/// For a .dll or .asi already in the game that's a newer version than the
+/// one about to replace it: (version there, version in the mod).
+fn newer_already(dest: &Path, from: &Path) -> Option<(String, String)> {
+    let e = crate::extract::ext(dest);
+    if !(e == "dll" || e == "asi") || !dest.is_file() {
+        return None;
+    }
+    let (have, new) = (crate::dotnet::file_version(dest)?, crate::dotnet::file_version(from)?);
+    let show = |v: [u16; 4]| format!("{}.{}.{}", v[0], v[1], v[2]);
+    (have > new).then(|| (show(have), show(new)))
+}
+
+/// RAGE Plugin Hook runs the console commands in this file, in the game
+/// folder, when the game starts.
+pub const STARTUP: &str = "startup.rphs";
+
+/// A plugin straight in `plugins\` (LSPDFR loads the ones in
+/// `plugins\LSPDFR\` itself).
+fn is_rph_plugin(game: &Path, rel: &Path) -> bool {
+    let comps: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect();
+    matches!(comps.as_slice(), [dir, file] if dir == "plugins" && file.ends_with(".dll")) && crate::dotnet::classify(&game.join(rel)) == crate::dotnet::Dll::RphPlugin
+}
+
+/// The plugin a `LoadPlugin` line loads.
+fn loads(line: &str) -> Option<&str> {
+    let line = line.trim();
+    let head = line.get(..10)?;
+    head.eq_ignore_ascii_case("loadplugin").then(|| line[10..].trim().trim_matches('"').trim())
+}
+
+/// startup.rphs with a LoadPlugin line for every `wanted` plugin, and
+/// without the lines for `owned` plugins that aren't wanted any more.
+/// Lines someone else wrote stay. Returns the text and the plugins whose
+/// lines this app now owns.
+fn startup_lines(text: &str, wanted: &[String], owned: &[String]) -> (String, Vec<String>) {
+    let is = |list: &[String], p: &str| list.iter().any(|x| x.eq_ignore_ascii_case(p));
+    let mut lines: Vec<&str> = text.lines().filter(|l| !loads(l).is_some_and(|p| is(owned, p) && !is(wanted, p))).collect();
+    let removed = lines.len() != text.lines().count();
+    let mut now_owned: Vec<String> = owned.iter().filter(|o| is(wanted, o)).cloned().collect();
+    let mut added = Vec::new();
+    for w in wanted {
+        if !lines.iter().any(|l| loads(l).is_some_and(|p| p.eq_ignore_ascii_case(w))) {
+            added.push(format!("LoadPlugin \"{w}\""));
+            if !is(&now_owned, w) {
+                now_owned.push(w.clone());
+            }
+        }
+    }
+    if !removed && added.is_empty() {
+        return (text.to_string(), now_owned);
+    }
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    lines.extend(added.iter().map(String::as_str));
+    let newline = if text.contains("\r\n") || text.is_empty() { "\r\n" } else { "\n" };
+    let out = lines.iter().map(|l| format!("{l}{newline}")).collect();
+    (out, now_owned)
+}
+
 fn same(a: &Path, b: &Path) -> bool {
     a.to_string_lossy().replace('/', "\\").eq_ignore_ascii_case(&b.to_string_lossy().replace('/', "\\"))
 }
@@ -646,6 +793,7 @@ mod tests {
         Plan {
             name: name.to_string(),
             exclusive: false,
+            warnings: vec![],
             sets: vec![Set { label: name.into(), selected: true, skipped: vec![], parts: vec![Part { kind: Kind::LspdfrPlugin, label: name.into(), actions }] }],
         }
     }
@@ -795,5 +943,123 @@ mod tests {
         assert!(protected(Path::new(r"LSPDFR Mod Installer\x.dll")).is_some());
         assert!(protected(Path::new(r"plugins\LSPDFR\x.dll")).is_none());
         assert!(protected(Path::new(r"lml\car\dlc.rpf")).is_none());
+    }
+
+    #[test]
+    fn startup_script_keeps_other_lines_and_only_drops_its_own() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let text = "LoadPlugin \"LSPD First Response.dll\"\r\n";
+        let (out, owned) = startup_lines(text, &s(&["LSPD First Response.dll", "Lights.dll"]), &[]);
+        assert_eq!(out, "LoadPlugin \"LSPD First Response.dll\"\r\nLoadPlugin \"Lights.dll\"\r\n");
+        assert_eq!(owned, ["Lights.dll"]);
+        // Nothing to do: the file is left exactly as it was.
+        assert_eq!(startup_lines(&out, &s(&["lights.dll"]), &owned).0, out);
+        // Off again: only the line this app added goes.
+        let (out, owned) = startup_lines(&out, &[], &owned);
+        assert_eq!(out, text);
+        assert!(owned.is_empty());
+        assert_eq!(startup_lines("", &s(&["A.dll"]), &[]).0, "LoadPlugin \"A.dll\"\r\n");
+        assert_eq!(loads("  loadplugin   \"My Plugin.dll\" "), Some("My Plugin.dll"));
+    }
+
+    fn one_part(name: &str, kind: Kind, actions: Vec<Action>) -> Plan {
+        Plan {
+            name: name.into(),
+            exclusive: false,
+            warnings: vec![],
+            sets: vec![Set { label: name.into(), selected: true, skipped: vec![], parts: vec![Part { kind, label: name.into(), actions }] }],
+        }
+    }
+
+    #[test]
+    fn never_downgrades_a_library() {
+        let root = tmp("versions");
+        let game = root.join("game");
+        fs::create_dir_all(&game).unwrap();
+        let newer = crate::dotnet::tests::versioned([1, 9, 3, 0]);
+        fs::write(game.join("RAGENativeUI.dll"), &newer).unwrap();
+        let old = root.join("RAGENativeUI.dll");
+        fs::write(&old, crate::dotnet::tests::versioned([1, 8, 1, 0])).unwrap();
+        let mut db = Db::load(&root.join("data"));
+        let plan = one_part("EUP Menu", Kind::GameFiles, vec![Action::Copy { from: old, to: PathBuf::from("RAGENativeUI.dll") }]);
+        let (m, notes) = db.install(&game, &plan, "test", false).unwrap();
+        assert_eq!(fs::read(game.join("RAGENativeUI.dll")).unwrap(), newer);
+        assert!(notes.iter().any(|n| n.contains("1.9.3") && n.contains("1.8.1")));
+        // It isn't the mod's file, so removing the mod leaves it.
+        db.uninstall(m.id).unwrap();
+        assert!(game.join("RAGENativeUI.dll").is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn eup_pack_outfits_are_in_eup_menu_while_the_pack_is_on() {
+        let root = tmp("presets");
+        let game = root.join("game");
+        fs::create_dir_all(game.join(r"plugins\EUP")).unwrap();
+        let base = "[Male LSPD Class A]\r\nGender=Male\r\nCategory=EUP\r\nCategory2=LSPD\r\n";
+        fs::write(game.join(eup::PRESETS), base).unwrap();
+        let mut db = Db::load(&root.join("data"));
+        let outfits = "[Male Met Police TSG Soft]\r\nGender=Male\r\nCategory=EUP\r\nCategory2=Met Police\r\n";
+        let plan = one_part("Met Police EUP", Kind::EupAddon, vec![Action::Write { to: PathBuf::from(eup::PACKS).join("Met Police.ini"), contents: outfits.into() }]);
+        let presets = || fs::read_to_string(game.join(eup::PRESETS)).unwrap();
+        let (m, notes) = db.install(&game, &plan, "test", false).unwrap();
+        assert!(presets().starts_with(base) && presets().contains(outfits));
+        assert!(notes.iter().any(|n| n.contains("Met Police section")));
+        db.set_enabled(m.id, false).unwrap();
+        assert_eq!(presets(), base);
+        db.set_enabled(m.id, true).unwrap();
+        assert!(presets().contains(outfits));
+        db.set_clean(&game, true).unwrap();
+        assert_eq!(presets(), base);
+        db.set_clean(&game, false).unwrap();
+        db.uninstall(m.id).unwrap();
+        assert_eq!(presets(), base);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rph_plugins_load_at_startup_while_their_mod_is_on() {
+        let root = tmp("startup");
+        let game = root.join("game");
+        fs::create_dir_all(&game).unwrap();
+        fs::write(game.join(STARTUP), "LoadPlugin \"LSPD First Response.dll\"\r\n").unwrap();
+        let src = root.join("Lights.dll");
+        fs::write(&src, crate::dotnet::tests::fake_dll(&["", "RagePluginHook", "PluginAttribute"])).unwrap();
+        let lib = root.join("Helper.dll");
+        fs::write(&lib, b"MZ").unwrap();
+        let mut db = Db::load(&root.join("data"));
+        let plan = Plan {
+            name: "Lights".into(),
+            exclusive: false,
+            warnings: vec![],
+            sets: vec![Set { label: "Lights".into(), selected: true, skipped: vec![], parts: vec![Part {
+                kind: Kind::RphPlugin,
+                label: "Lights".into(),
+                actions: vec![
+                    Action::Copy { from: src.clone(), to: PathBuf::from(r"plugins\Lights.dll") },
+                    Action::Copy { from: lib.clone(), to: PathBuf::from(r"plugins\Helper.dll") },
+                    Action::Write { to: PathBuf::from(r"plugins\Lights.ini"), contents: "[x]".into() },
+                ],
+            }] }],
+        };
+        let script = || fs::read_to_string(game.join(STARTUP)).unwrap();
+        let both = "LoadPlugin \"LSPD First Response.dll\"\r\nLoadPlugin \"Lights.dll\"\r\n";
+        let (m, notes) = db.install(&game, &plan, "test", false).unwrap();
+        assert_eq!(script(), both);
+        assert!(notes.iter().any(|n| n.contains("Lights.dll")));
+        db.set_enabled(m.id, false).unwrap();
+        assert_eq!(script(), "LoadPlugin \"LSPD First Response.dll\"\r\n");
+        db.set_enabled(m.id, true).unwrap();
+        assert_eq!(script(), both);
+        // An update keeps the one line.
+        let (m, _) = db.install(&game, &plan, "test", false).unwrap();
+        assert_eq!(script(), both);
+        db.set_clean(&game, true).unwrap();
+        assert_eq!(script(), "LoadPlugin \"LSPD First Response.dll\"\r\n");
+        db.set_clean(&game, false).unwrap();
+        assert_eq!(script(), both);
+        db.uninstall(m.id).unwrap();
+        assert_eq!(script(), "LoadPlugin \"LSPD First Response.dll\"\r\n");
+        let _ = fs::remove_dir_all(&root);
     }
 }

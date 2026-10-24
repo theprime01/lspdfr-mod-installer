@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::dotnet::{self, Dll};
+use crate::eup;
 use crate::extract::ext;
 use crate::lml::{self, DataFile, Package};
 
@@ -20,6 +21,8 @@ pub enum Kind {
     ReplaceVehicle,
     DlcPack,
     LmlMod,
+    Eup,
+    EupAddon,
     Els,
     LspdfrFiles,
     Library,
@@ -37,6 +40,8 @@ impl Kind {
             Kind::ReplaceVehicle => "Replacement vehicle",
             Kind::DlcPack => "DLC pack",
             Kind::LmlMod => "Mod Loader package",
+            Kind::Eup => "EUP uniforms",
+            Kind::EupAddon => "EUP add-on",
             Kind::Els => "ELS lighting config",
             Kind::LspdfrFiles => "LSPDFR files",
             Kind::Library => "Library",
@@ -87,6 +92,8 @@ pub struct Plan {
     pub sets: Vec<Set>,
     /// The sets are alternative versions of the same mod: install one.
     pub exclusive: bool,
+    /// Things to know before installing, like a pack made for an old EUP.
+    pub warnings: Vec<String>,
 }
 
 impl Plan {
@@ -128,36 +135,74 @@ const GAME_ROOT_FILES: &[&str] = &["scripthookv.dll", "dinput8.dll", "rageplugin
 const GENERIC: &[&str] = &[
     "stream", "data", "addon", "add-on", "addons", "replace", "replacement", "els", "non-els", "non els", "nonels", "files", "resource",
     "fivem", "singleplayer", "single player", "sp", "grand theft auto v", "gta v", "gtav", "gta5", "main files", "install", "vehicle", "vehicles",
+    "eup", "uniform", "uniforms", "clothing", "clothes",
 ];
 const OPTIONAL: &[&str] = &["optional", "extra", "extras", "alternative", "alternate", "old", "legacy", "backup", "original", "uninstall"];
-const DOCS: &[&str] = &["txt", "md", "pdf", "url", "html", "htm", "rtf", "doc", "docx", "nfo", "png", "jpg", "jpeg", "gif", "bmp", "webp", "mp4", "psd"];
+const DOCS: &[&str] = &["txt", "md", "pdf", "url", "html", "htm", "rtf", "doc", "docx", "nfo", "png", "jpg", "jpeg", "gif", "bmp", "webp", "mp4", "psd", "pdn", "xcf"];
 
 pub fn analyze(root: &Path, name: &str) -> Plan {
     let top = unwrap(root);
     let groups: Vec<PathBuf> = subdirs(&top).into_iter().filter(|d| has_content(d)).collect();
     let loose = files(&top).iter().any(|f| !is_doc(f, true) && is_installable(f));
-    let mut ctx = Ctx { base: root.to_path_buf(), name: name.to_string(), lml_used: HashSet::new() };
+    let mut ctx = Ctx { base: root.to_path_buf(), name: name.to_string(), lml_used: HashSet::new(), clothing: has_clothing(&top) };
     let sets: Vec<Set> = if is_mirror(&top) || loose || groups.len() <= 1 {
         vec![ctx.set(&top, name.to_string(), true)]
     } else {
-        groups.iter().map(|g| {
+        let mut sets = Vec::new();
+        for g in &groups {
             let label = file_name(g);
-            let optional = OPTIONAL.iter().any(|o| label.to_lowercase().contains(o));
-            ctx.set(g, label, !optional)
-        }).collect()
+            let inner: Vec<PathBuf> = subdirs(g).into_iter().filter(|d| has_content(d)).collect();
+            let loose = files(g).iter().any(|f| !is_doc(f, false) && is_installable(f));
+            // An extras folder: each add-on in it is its own choice, so a
+            // recommended plugin isn't left out with the rest.
+            if is_optional(&label) && !inner.is_empty() && !loose && !is_mirror(g) && !vehicle_root(g) {
+                for d in &inner {
+                    let sub = format!("{label} / {}", file_name(d)).split_whitespace().collect::<Vec<_>>().join(" ");
+                    let on = wanted(&sub);
+                    sets.push(ctx.set(d, sub, on));
+                }
+            } else {
+                let on = wanted(&label);
+                sets.push(ctx.set(g, label, on));
+            }
+        }
+        sets
     };
-    let mut plan = Plan { name: name.to_string(), exclusive: collide(&sets), sets };
+    let mut plan = Plan { name: name.to_string(), exclusive: collide(&sets), sets, warnings: Vec::new() };
     if plan.exclusive {
         let first = plan.sets.iter().position(|s| s.selected).unwrap_or(0);
         plan.select(first, true);
     }
+    if plan.sets.iter().flat_map(|s| &s.parts).any(|p| p.kind == Kind::EupAddon) {
+        let readmes = all_files(root).into_iter().filter(|f| matches!(ext(f).as_str(), "txt" | "md" | "rtf" | "nfo"));
+        if let Some((major, minor)) = readmes.filter_map(|f| fs::read(&f).ok()).filter_map(|b| eup::made_for_old_eup(&String::from_utf8_lossy(&b))).max() {
+            let (cm, cn) = eup::CURRENT;
+            plan.warnings.push(format!("Made for EUP {major}.{minor}, and EUP is {cm}.{cn} now. EUP's clothing has moved since, so this pack's textures can end up on the wrong clothes. Look for a version made for EUP {cm}.{cn}."));
+        }
+    }
     plan
+}
+
+fn is_optional(label: &str) -> bool {
+    let l = label.to_lowercase();
+    OPTIONAL.iter().any(|o| l.contains(o))
+}
+
+/// Whether a set starts ticked: the main files, and extras the author
+/// recommends.
+fn wanted(label: &str) -> bool {
+    let l = label.to_lowercase();
+    !is_optional(label) || (l.contains("recommended") && !l.contains("not recommended"))
 }
 
 struct Ctx {
     base: PathBuf,
     name: String,
     lml_used: HashSet<String>,
+    /// The download is EUP clothing somewhere: models and textures outside
+    /// a clothing set folder are the author's source files or steps from
+    /// the readme, not cars.
+    clothing: bool,
 }
 
 impl Ctx {
@@ -180,7 +225,11 @@ impl Ctx {
     fn lml_name(&mut self, dir: &Path) -> String {
         let own = file_name(dir);
         let base = if GENERIC.contains(&own.to_lowercase().as_str()) || own.is_empty() { self.name.clone() } else { own };
-        let base = lml::folder_name(&base);
+        self.unique_lml(&base)
+    }
+
+    fn unique_lml(&mut self, base: &str) -> String {
+        let base = lml::folder_name(base);
         let mut name = base.clone();
         let mut n = 2;
         while !self.lml_used.insert(name.to_lowercase()) {
@@ -191,8 +240,27 @@ impl Ctx {
     }
 
     fn walk(&mut self, dir: &Path, out: &mut Out) {
+        if let Some(xml) = lml_install_xml(dir) {
+            return self.lml_package(dir, &xml, out);
+        }
         if is_mirror(dir) {
             return self.mirror(dir, out);
+        }
+        if has_clothing(dir) {
+            return self.clothing(dir, out);
+        }
+        if self.clothing && vehicle_root(dir) {
+            for f in all_files(dir) {
+                let reason = if lml::is_streamed(&f) {
+                    "Clothing outside a clothing set folder: the pack's readme says where it goes, if anywhere"
+                } else if is_doc(&f, false) || matches!(ext(&f).as_str(), "png" | "txt") {
+                    "Readme or picture"
+                } else {
+                    "Don't know where this goes"
+                };
+                self.skip(out, &f, reason);
+            }
+            return;
         }
         if vehicle_root(dir) {
             return self.vehicle(dir, out);
@@ -237,7 +305,9 @@ impl Ctx {
                 "xml" if is_els(f) => {
                     out.add(Kind::Els, stem(f), Action::Copy { from: f.clone(), to: PathBuf::from("ELS").join("pack_default").join(file_name(f)) });
                 }
-                _ if is_doc(f, top) => self.skip(out, f, "Readme or picture"),
+                "ini" if file_name(f).eq_ignore_ascii_case("wardrobe.ini") => self.wardrobe(f, out),
+                _ if is_texture_image(f) => self.skip(out, f, "Texture image: it has to go into a .ytd with OpenIV before the game can use it"),
+                _ if is_doc(f, top) || (self.clothing && is_doc(f, true)) => self.skip(out, f, "Readme or picture"),
                 _ => match &home {
                     Some((index, dest)) => out.attach(*index, Action::Copy { from: f.clone(), to: dest.join(file_name(f)) }),
                     None if lml::data_type(&file_name(f)).is_some() => self.skip(out, f, "Data file without a model: merge it by hand"),
@@ -286,6 +356,12 @@ impl Ctx {
                 self.skip(out, &f, "Game archive: it can't be dropped in as a file");
                 continue;
             }
+            // Its outfits become their own agency instead of replacing the
+            // wardrobe someone has saved outfits in.
+            if parts.last().is_some_and(|n| n == "wardrobe.ini") {
+                self.wardrobe(&f, out);
+                continue;
+            }
             if is_doc(&f, at_top) {
                 self.skip(out, &f, "Readme or picture");
                 continue;
@@ -307,6 +383,65 @@ impl Ctx {
             };
             out.add(kind, label, Action::Copy { from: f.clone(), to: rel });
         }
+    }
+
+    /// A package already made for LML: copied into `lml\` as it is. EUP's
+    /// own package leaves out its 2021 LSPDFR outfit files, which crash
+    /// LSPDFR 0.4.9, and its preset outfits become a real file so add-on
+    /// packs can add their agencies to it.
+    fn lml_package(&mut self, dir: &Path, xml: &str, out: &mut Out) {
+        let own = eup::tag(xml, "Name").map(|n| n.replace("&amp;", "&").replace(" & ", " and ").replace('&', " and ")).unwrap_or_else(|| file_name(dir));
+        let name = self.unique_lml(&own);
+        let root = lml::root(&name);
+        let is_eup = eup::is_eup_package(xml);
+        let overlays = eup::game_folders(xml);
+        let kind = if is_eup { Kind::Eup } else { Kind::LmlMod };
+        let mut part: Option<usize> = None;
+        for f in all_files(dir) {
+            let rel = f.strip_prefix(dir).unwrap_or(&f).to_path_buf();
+            let rel_s = rel.to_string_lossy().replace('\\', "/").to_lowercase();
+            let inner = overlays.iter().find_map(|o| rel_s.strip_prefix(&format!("{o}/")).map(str::to_string));
+            let action = match inner.as_deref() {
+                Some(i) if is_eup && i.starts_with("lspdfr/") => {
+                    self.skip(out, &f, "EUP's LSPDFR outfit files are from 2021 and crash LSPDFR 0.4.9, so LSPDFR keeps its own");
+                    continue;
+                }
+                Some("plugins/eup/presetoutfits.ini") if is_eup => Action::Copy { from: f.clone(), to: PathBuf::from(eup::PRESETS) },
+                _ => Action::Copy { from: f.clone(), to: root.join(&rel) },
+            };
+            match part {
+                Some(i) => out.attach(i, action),
+                None => part = Some(out.add(kind, name.clone(), action)),
+            }
+        }
+    }
+
+    /// EUP add-on clothing: every streamed file under a clothing set folder,
+    /// in one LML package that loads after EUP.
+    fn clothing(&mut self, dir: &Path, out: &mut Out) {
+        let name = self.lml_name(dir);
+        let root = lml::root(&name);
+        let i = out.add(Kind::EupAddon, name.clone(), Action::Write { to: root.join("install.xml"), contents: lml::install_xml(&name, &Package::Clothing) });
+        for f in all_files(dir) {
+            match clothing_set(dir, &f) {
+                Some(set) if lml::is_streamed(&f) => out.attach(i, Action::Copy { from: f.clone(), to: root.join("stream").join(set).join(file_name(&f)) }),
+                _ if file_name(&f).eq_ignore_ascii_case("wardrobe.ini") => self.wardrobe(&f, out),
+                _ if is_texture_image(&f) => self.skip(out, &f, "Texture image: it has to go into a .ytd with OpenIV before the game can use it"),
+                _ if is_doc(&f, false) || matches!(ext(&f).as_str(), "txt") => self.skip(out, &f, "Readme or picture"),
+                _ => self.skip(out, &f, "Don't know where this goes"),
+            }
+        }
+    }
+
+    /// A pack's EUP Menu outfits, as its own agency.
+    fn wardrobe(&mut self, f: &Path, out: &mut Out) {
+        let text = fs::read(f).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+        if !eup::is_wardrobe(&text) {
+            return self.skip(out, f, "Not an EUP Menu outfit list");
+        }
+        let agency = eup::agency_name(&self.name);
+        let to = PathBuf::from(eup::PACKS).join(format!("{}.ini", lml::folder_name(&agency)));
+        out.add(Kind::EupAddon, agency.clone(), Action::Write { to, contents: eup::presets_from_wardrobe(&agency, &text) });
     }
 
     fn dlc(&mut self, dir: &Path, rpf: &Path, out: &mut Out) {
@@ -527,6 +662,28 @@ fn is_els(f: &Path) -> bool {
     fs::read(f).map(|b| String::from_utf8_lossy(&b[..b.len().min(4096)]).to_lowercase().contains("<vcfroot")).unwrap_or(false)
 }
 
+/// The install.xml of a folder that's already an LML package.
+fn lml_install_xml(dir: &Path) -> Option<String> {
+    let f = files(dir).into_iter().find(|f| file_name(f).eq_ignore_ascii_case("install.xml"))?;
+    let text = String::from_utf8_lossy(&fs::read(f).ok()?).into_owned();
+    text.contains("<EasyInstall").then_some(text)
+}
+
+/// The clothing set folder a file sits in, below `dir`.
+fn clothing_set(dir: &Path, f: &Path) -> Option<String> {
+    f.ancestors().skip(1).take_while(|a| a.starts_with(dir)).map(file_name).find(|n| eup::is_collection(n))
+}
+
+/// EUP-style clothing: streamed files in clothing set folders.
+fn has_clothing(dir: &Path) -> bool {
+    all_files(dir).iter().any(|f| lml::is_streamed(f) && clothing_set(dir, f).is_some())
+}
+
+/// A picture of a clothing texture, like `task_diff_008_a_uni.png`.
+fn is_texture_image(f: &Path) -> bool {
+    matches!(ext(f).as_str(), "png" | "dds" | "tga" | "jpg") && stem(f).to_lowercase().contains("_diff_")
+}
+
 fn is_streamed_or_data(f: &Path) -> bool {
     lml::is_streamed(f) || ext(f) == "meta"
 }
@@ -540,7 +697,7 @@ fn is_doc(f: &Path, top: bool) -> bool {
     }
     let name = stem(f).to_lowercase();
     let readme = ["readme", "read me", "read_me", "license", "licence", "changelog", "credits", "instructions", "install", "how to", "terms"].iter().any(|w| name.contains(w));
-    top || readme || matches!(e.as_str(), "url" | "pdf" | "md" | "nfo" | "doc" | "docx" | "rtf" | "psd" | "mp4")
+    top || readme || matches!(e.as_str(), "url" | "pdf" | "md" | "nfo" | "doc" | "docx" | "rtf" | "psd" | "pdn" | "xcf" | "mp4")
 }
 
 fn is_installable(f: &Path) -> bool {
@@ -605,6 +762,110 @@ mod tests {
         let mut v: Vec<String> = plan.parts().flat_map(|p| p.actions.iter()).map(|a| a.to().to_string_lossy().replace('\\', "/")).collect();
         v.sort();
         v
+    }
+
+    #[test]
+    fn eup_goes_in_as_its_lml_package_without_its_old_lspdfr_files() {
+        let xml = b"<EasyInstall><Name>EUP - Law &amp; Order Public</Name><MountName>eup</MountName><ResourceFolders><GameFolder>content/configs</GameFolder></ResourceFolders></EasyInstall>";
+        let t = tree(&[
+            ("EUP_L&O_Public/install.xml", xml),
+            ("EUP_L&O_Public/content/dlc/dlc.rpf", b"RPF7"),
+            ("EUP_L&O_Public/content/stream/peds/mp_m_freemode_01/jbib_014_u.ydd", b"x"),
+            ("EUP_L&O_Public/content/configs/Plugins/EUPMenu.dll", b"MZ"),
+            ("EUP_L&O_Public/content/configs/Plugins/EUP/presetoutfits.ini", b"[Male LSPD Class A]"),
+            ("EUP_L&O_Public/content/configs/lspdfr/data/agency.xml", b"<Agencies/>"),
+            ("EUP_L&O_Public/content/configs/lspdfr/data/custom/outfits_lspd_eup.xml", b"<Outfits/>"),
+        ]);
+        let plan = analyze(&t.0, "EUP_L_O_8.3_LML_Package");
+        assert_eq!(plan.kinds(), [Kind::Eup]);
+        assert_eq!(targets(&plan), [
+            "lml/EUP - Law and Order Public/content/configs/Plugins/EUPMenu.dll",
+            "lml/EUP - Law and Order Public/content/dlc/dlc.rpf",
+            "lml/EUP - Law and Order Public/content/stream/peds/mp_m_freemode_01/jbib_014_u.ydd",
+            "lml/EUP - Law and Order Public/install.xml",
+            "plugins/EUP/presetoutfits.ini",
+        ]);
+        assert_eq!(plan.sets[0].skipped.len(), 2);
+    }
+
+    #[test]
+    fn eup_add_ons_load_after_eup_with_their_own_menu_section() {
+        let t = tree(&[
+            ("Met Police EUP 1.1/Read Me.txt", b"==> Install EUP 8.1"),
+            ("Met Police EUP 1.1/GTA Directory/Plugins/EUP/wardrobe.ini", b"[TSG Soft]\r\nGender=Male\r\nTop=100:1\r\n"),
+            ("Met Police EUP 1.1/Uniforms/TSG/mp_m_freemode_01_male_apt01/jbib_diff_008_a_uni.ytd", b"x"),
+            ("Met Police EUP 1.1/Uniforms/TSG/Helmet/x64/models/cdimages/p/mp_m_freemode_01_p_mp_m_christmas2017/p_head_diff_000_a.ytd", b"x"),
+            ("Met Police EUP 1.1/Uniforms/TSG/preview.png", b"x"),
+            ("Met Police EUP 1.1/Uniforms/TSG/task_diff_008_a_uni.png", b"x"),
+        ]);
+        let plan = analyze(&t.0, "Met Police EUP 1.1 New Install");
+        assert_eq!(plan.kinds(), [Kind::EupAddon]);
+        assert_eq!(targets(&plan), [
+            "lml/Met Police EUP 1.1 New Install/install.xml",
+            "lml/Met Police EUP 1.1 New Install/stream/mp_m_freemode_01_male_apt01/jbib_diff_008_a_uni.ytd",
+            "lml/Met Police EUP 1.1 New Install/stream/mp_m_freemode_01_p_mp_m_christmas2017/p_head_diff_000_a.ytd",
+            "plugins/EUP/packs/Met Police.ini",
+        ]);
+        let written = |to: &str| plan.parts().flat_map(|p| &p.actions).find_map(|a| match a {
+            Action::Write { to: t, contents } if t.to_string_lossy().replace('\\', "/") == to => Some(contents.clone()),
+            _ => None,
+        }).unwrap();
+        assert!(written("lml/Met Police EUP 1.1 New Install/install.xml").contains("<IsExtension>true</IsExtension>"));
+        assert!(written("plugins/EUP/packs/Met Police.ini").starts_with("[Male Met Police TSG Soft]\r\nGender=Male\r\nCategory=EUP\r\nCategory2=Met Police\r\n"));
+        assert_eq!(plan.warnings.len(), 1);
+        assert!(plan.warnings[0].contains("EUP 8.1"));
+        let reasons: Vec<&str> = plan.sets.iter().flat_map(|s| &s.skipped).map(|s| s.reason).collect();
+        assert!(reasons.iter().any(|r| r.starts_with("Texture image")));
+    }
+
+    #[test]
+    fn an_eup_packs_source_textures_dont_make_it_a_choice_of_versions() {
+        // Santos Constabulary: loose copies of its textures sit in a
+        // Textures folder next to the real ones in Uniforms.
+        let t = tree(&[
+            ("Santos Constabulary 1.0.1 EUP 8.3/Readme.txt", b"==> Install EUP 8.3"),
+            ("Santos Constabulary 1.0.1 EUP 8.3/EUP Menu/Plugins/EUP/wardrobe.ini", b"[LPU Shirt & Tie]\r\nGender=Male\r\nTop=200:1\r\n"),
+            ("Santos Constabulary 1.0.1 EUP 8.3/Textures/Shoulder Radio/male/accs_diff_021_a_uni.ytd", b"x"),
+            ("Santos Constabulary 1.0.1 EUP 8.3/Textures/Fleece/fleece.png", b"x"),
+            ("Santos Constabulary 1.0.1 EUP 8.3/Uniforms/Male/Body/mp_m_freemode_01/accs_diff_021_a_uni.ytd", b"x"),
+            ("Santos Constabulary 1.0.1 EUP 8.3/Screenshots/SC1.png", b"x"),
+        ]);
+        let plan = analyze(&t.0, "Santos Constabulary 1.0.1 EUP 8.3");
+        assert!(!plan.exclusive);
+        assert!(plan.warnings.is_empty());
+        assert_eq!(targets(&plan), [
+            "lml/Santos Constabulary 1.0.1 EUP 8.3/install.xml",
+            "lml/Santos Constabulary 1.0.1 EUP 8.3/stream/mp_m_freemode_01/accs_diff_021_a_uni.ytd",
+            "plugins/EUP/packs/Santos Constabulary.ini",
+        ]);
+        let reasons: Vec<&str> = plan.sets.iter().flat_map(|s| &s.skipped).map(|s| s.reason).collect();
+        assert!(reasons.iter().any(|r| r.starts_with("Clothing outside a clothing set folder")));
+        assert!(!reasons.contains(&"Don't know where this goes"));
+    }
+
+    #[test]
+    fn extras_are_separate_choices_and_recommended_ones_start_ticked() {
+        let rph = dll(&["RagePluginHook", "PluginAttribute"]);
+        let t = tree(&[
+            ("Charger/1 - Vehicle/charger/dlc.rpf", b"RPF7"),
+            ("Charger/2 - ELS/charger.xml", b"<vcfroot Description=\"x\">"),
+            ("Charger/3 - Extras/1 - Optional but HIGHLY Recommended  [LSPDFR]/Cruise Lights/plugins/CruiseLights.dll", &rph),
+            ("Charger/3 - Extras/1 - Optional but HIGHLY Recommended  [LSPDFR]/README.md", b"x"),
+            ("Charger/3 - Extras/2 - Template/sign.png", b"x"),
+            ("Charger/3 - Extras/2 - Template/sign.pdn", b"x"),
+            ("Charger/3 - Extras/3 - Old lights/plugins/OldLights.dll", &rph),
+        ]);
+        let plan = analyze(&t.0, "Charger");
+        let sets: Vec<(&str, bool)> = plan.sets.iter().map(|s| (s.label.as_str(), s.selected)).collect();
+        assert_eq!(sets, [
+            ("1 - Vehicle", true),
+            ("2 - ELS", true),
+            ("3 - Extras / 1 - Optional but HIGHLY Recommended [LSPDFR]", true),
+            ("3 - Extras / 3 - Old lights", false),
+        ]);
+        assert!(targets(&plan).contains(&"plugins/CruiseLights.dll".to_string()));
+        assert!(!targets(&plan).contains(&"plugins/OldLights.dll".to_string()));
+        assert!(!wanted("Optional (not recommended)"));
     }
 
     #[test]

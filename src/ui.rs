@@ -4,6 +4,7 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::analyze::{Action, Kind, Plan};
 use crate::crash;
+use crate::eup;
 use crate::game::{self, PREREQS};
 use crate::install::{self, Db, GameState};
 use crate::jobs::{Jobs, State};
@@ -17,6 +18,7 @@ const RED: Color32 = Color32::from_rgb(225, 90, 80);
 enum Tab {
     Install,
     Installed,
+    Eup,
     Setup,
     Crash,
     Log,
@@ -184,6 +186,7 @@ impl App {
                 Some(n) => format!("Installed ({n})"),
                 None => "Installed".to_string(),
             });
+            ui.selectable_value(&mut self.tab, Tab::Eup, "EUP");
             let setup = if missing > 0 { RichText::new(format!("Setup ({missing} missing)")).color(AMBER) } else { RichText::new("Setup") };
             ui.selectable_value(&mut self.tab, Tab::Setup, setup);
             let crashes = self.crash.as_ref().map_or(0, |(_, f)| f.len());
@@ -393,6 +396,9 @@ impl App {
                         if let Some(g) = &game {
                             needs(ui, plan, g);
                         }
+                        for w in &plan.warnings {
+                            ui.colored_label(AMBER, w);
+                        }
                         plan_view(ui, job.id, plan, &job.state, &mut actions);
                     }
                 });
@@ -551,6 +557,103 @@ impl App {
                 },
             }
         }
+    }
+
+    fn eup_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(game) = self.game() else {
+            ui.label("Choose your GTA V folder first.");
+            return;
+        };
+        let mods: Vec<install::Mod> = match self.jobs.db.try_lock() {
+            Ok(db) => db.mods.iter().filter(|m| m.game == game).cloned().collect(),
+            Err(_) => Vec::new(),
+        };
+        let s = eup::status(&game);
+        ui.label("The Emergency Uniforms Pack: police uniforms you put on in game with EUP Menu. Drop EUP downloads on the Install tab: the LML version of Law & Order, EUP Menu, and add-on packs like a British police pack.");
+        ui.add_space(6.0);
+        let mut changes = Vec::new();
+        let have = |ui: &mut egui::Ui, on: bool, text: String, optional: bool| {
+            if on {
+                ui.colored_label(GREEN, text);
+            } else {
+                ui.colored_label(if optional { AMBER } else { RED }, text);
+            }
+        };
+        egui::Grid::new("eup").num_columns(3).spacing([16.0, 8.0]).striped(true).show(ui, |ui| {
+            ui.label(RichText::new("EUP Law & Order").strong());
+            match (&s.law_order, &s.law_order_version) {
+                (Some(_), Some(v)) => have(ui, true, format!("Installed ({v})"), false),
+                (Some(_), None) => have(ui, true, "Installed".into(), false),
+                (None, _) => have(ui, false, "Not installed".into(), false),
+            }
+            if ui.small_button("Download page").clicked() {
+                open(game::prereq(game::Need::Eup).url);
+            }
+            ui.end_row();
+
+            ui.label(RichText::new("EUP Serve & Rescue").strong());
+            have(ui, s.serve_rescue, if s.serve_rescue { "Installed".into() } else { "Not installed (fire and EMS uniforms)".into() }, true);
+            if ui.small_button("Download page").clicked() {
+                open("https://www.lcpdfr.com/downloads/gta5mods/character/16256-emergency-uniforms-pack-serve-rescue/");
+            }
+            ui.end_row();
+
+            ui.label(RichText::new("EUP Menu").strong());
+            match s.menu_version {
+                Some(v) => {
+                    let key = s.menu_key.clone().map(|k| format!(", opens with {k}")).unwrap_or_default();
+                    have(ui, true, format!("Installed ({}.{}.{}{key})", v[0], v[1], v[2]), false);
+                }
+                None => have(ui, false, "Not installed".into(), false),
+            }
+            ui.horizontal(|ui| {
+                if game.join(eup::SETTINGS).is_file() {
+                    if ui.small_button("Change the key").on_hover_text("Opens EUP Menu's settings.ini: MenuToggle is the key").clicked() {
+                        changes.push(Change::Edit(game.join(eup::SETTINGS)));
+                    }
+                } else if ui.small_button("Download page").clicked() {
+                    open(game::prereq(game::Need::EupMenu).url);
+                }
+            });
+            ui.end_row();
+
+            for need in [game::Need::HeapAdjuster, game::Need::PackfileAdjuster] {
+                let p = game::prereq(need);
+                let on = game::has(&game, need);
+                ui.label(RichText::new(p.name).strong());
+                have(ui, on, if on { "Installed".into() } else { "Not installed (recommended with lots of add-ons)".into() }, true);
+                if ui.small_button("Download page").clicked() {
+                    open(p.url);
+                }
+                ui.end_row();
+            }
+        });
+
+        ui.add_space(12.0);
+        ui.label(RichText::new("Add-on packs").strong());
+        let packs: Vec<&install::Mod> = mods.iter().filter(|m| m.kinds.contains(&Kind::EupAddon)).collect();
+        if packs.is_empty() {
+            ui.label(RichText::new("None yet. Retextures and new clothing for EUP show up here.").weak());
+        }
+        for m in packs {
+            ui.horizontal(|ui| {
+                let mut on = m.enabled;
+                if ui.checkbox(&mut on, RichText::new(&m.name).strong()).on_hover_text("Switch the pack's clothing and its EUP Menu section on or off").changed() {
+                    changes.push(Change::Enable(m.id, on));
+                }
+                let sections: Vec<String> = m.files.iter().filter(|f| f.path.parent().is_some_and(|p| p.to_string_lossy().eq_ignore_ascii_case(eup::PACKS))).filter_map(|f| f.path.file_stem().map(|s| s.to_string_lossy().into_owned())).collect();
+                if !sections.is_empty() {
+                    ui.label(RichText::new(format!("EUP Menu section: {}", sections.join(", "))).weak());
+                }
+            });
+        }
+
+        ui.add_space(12.0);
+        ui.label(RichText::new("How it works").strong());
+        ui.label("Add-on packs load after EUP, so their clothing wins. Outfits that come with a pack get their own section in EUP Menu instead of replacing your wardrobe, and the section goes when the pack is switched off.");
+        ui.label("EUP's own LSPDFR outfit files are left out: they're from 2021 and crash LSPDFR 0.4.9 when it dresses a cop. LSPDFR's police keep LSPDFR's outfits; put EUP uniforms on with EUP Menu.");
+        ui.label(format!("Packs made for an older EUP than {}.{} put their textures on the wrong clothes. The Install tab warns when a pack's readme says it's for an older one.", eup::CURRENT.0, eup::CURRENT.1));
+        self.apply(changes, &mods);
     }
 
     fn setup_tab(&mut self, ui: &mut egui::Ui) {
@@ -917,6 +1020,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Install => self.install_tab(ui),
             Tab::Installed => self.installed_tab(ui),
+            Tab::Eup => self.eup_tab(ui),
             Tab::Setup => self.setup_tab(ui),
             Tab::Crash => self.crash_tab(ui),
             Tab::Log => self.log_tab(ui),

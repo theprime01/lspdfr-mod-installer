@@ -130,6 +130,10 @@ pub enum Need {
     Lml,
     OpenIvAsi,
     Els,
+    Eup,
+    EupMenu,
+    HeapAdjuster,
+    PackfileAdjuster,
 }
 
 pub struct Prereq {
@@ -149,9 +153,13 @@ pub const PREREQS: &[Prereq] = &[
     Prereq { need: Need::Lml, name: "Lenny's Mod Loader", what: "Loads cars and other add-ons without editing game archives.", url: "https://www.lcpdfr.com/downloads/gta5mods/misc/25437-lennys-mod-loader/", essential: true, github: None },
     Prereq { need: Need::ScriptHookV, name: "Script Hook V", what: "Needed for .asi mods and .NET scripts.", url: "http://www.dev-c.com/gtav/scripthookv/", essential: false, github: None },
     Prereq { need: Need::AsiLoader, name: "ASI Loader (dinput8.dll)", what: "Loads .asi mods. Comes with Script Hook V.", url: "https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases", essential: false, github: Some(("ThirteenAG/Ultimate-ASI-Loader", "Ultimate-ASI-Loader_x64.zip")) },
-    Prereq { need: Need::Shvdn, name: "Script Hook V .NET", what: "Runs scripts in the scripts folder.", url: "https://github.com/scripthookvdotnet/scripthookvdotnet/releases", essential: false, github: Some(("scripthookvdotnet/scripthookvdotnet", "ScriptHookVDotNet.zip")) },
+    Prereq { need: Need::Shvdn, name: "Script Hook V .NET", what: "Runs scripts in the scripts folder. Only needed if you have some: without scripts it can crash the game as it loads.", url: "https://github.com/scripthookvdotnet/scripthookvdotnet/releases", essential: false, github: Some(("scripthookvdotnet/scripthookvdotnet", "ScriptHookVDotNet.zip")) },
     Prereq { need: Need::OpenIvAsi, name: "OpenIV.asi", what: "Lets the game read unencrypted DLC packs and the mods folder.", url: "https://openiv.com/", essential: false, github: None },
     Prereq { need: Need::Els, name: "Emergency Lighting System", what: "Needed by cars that come with an ELS .xml.", url: "https://www.lcpdfr.com/search/?q=Emergency%20Lighting%20System&type=downloads_file", essential: false, github: None },
+    Prereq { need: Need::Eup, name: "EUP Law & Order", what: "Police uniforms. Get the LML version. Needed by EUP add-on packs.", url: "https://www.lcpdfr.com/downloads/gta5mods/character/8151-emergency-uniforms-pack-law-order/", essential: false, github: None },
+    Prereq { need: Need::EupMenu, name: "EUP Menu", what: "Puts on EUP uniforms in game.", url: "https://www.lcpdfr.com/downloads/gta5mods/scripts/13245-eup-menu/", essential: false, github: None },
+    Prereq { need: Need::HeapAdjuster, name: "Heap Adjuster", what: "Raises the game's memory limit, for lots of cars and clothing.", url: "https://www.gta5-mods.com/tools/heapadjuster-enhanced", essential: false, github: None },
+    Prereq { need: Need::PackfileAdjuster, name: "Packfile Limit Adjuster", what: "Raises how many archives the game can load, for lots of DLC packs.", url: "https://www.gta5-mods.com/scripts/packfile-limit-adjuster-enhanced", essential: false, github: None },
 ];
 
 pub fn has(game: &Path, need: Need) -> bool {
@@ -166,7 +174,20 @@ pub fn has(game: &Path, need: Need) -> bool {
         Need::Lml => f("vfs.dll") || f("vfs.asi"),
         Need::OpenIvAsi => f("OpenIV.asi"),
         Need::Els => f("ELS.asi"),
+        Need::Eup => crate::eup::status(game).law_order.is_some(),
+        Need::EupMenu => f(r"plugins\EUPMenu.dll"),
+        Need::HeapAdjuster => has_asi(game, "heapadjuster"),
+        Need::PackfileAdjuster => has_asi(game, "packfilelimitadjuster"),
     }
+}
+
+/// An .asi in the game folder whose name contains this (any version of a
+/// tool, renamed or not).
+fn has_asi(game: &Path, part: &str) -> bool {
+    std::fs::read_dir(game).into_iter().flatten().flatten().any(|e| {
+        let n = e.file_name().to_string_lossy().to_lowercase();
+        n.ends_with(".asi") && n.contains(part)
+    })
 }
 
 /// What a kind of mod needs in order to work.
@@ -178,6 +199,8 @@ pub fn needs(kind: Kind) -> &'static [Need] {
         Kind::Asi => &[Need::ScriptHookV, Need::AsiLoader],
         Kind::AddonVehicle | Kind::ReplaceVehicle | Kind::LmlMod => &[Need::Lml],
         Kind::DlcPack => &[Need::Lml, Need::OpenIvAsi],
+        Kind::Eup => &[Need::Lml, Need::Rph],
+        Kind::EupAddon => &[Need::Lml, Need::Eup, Need::EupMenu],
         Kind::Els => &[Need::Els],
         Kind::Library | Kind::GameFiles => &[],
     }
@@ -199,6 +222,10 @@ pub fn provides(plan: &crate::analyze::Plan, need: Need) -> bool {
         Need::OpenIvAsi => "openiv.asi",
         Need::Els => "els.asi",
         Need::RageNativeUi => "ragenativeui.dll",
+        Need::Eup => return plan.kinds().contains(&Kind::Eup),
+        Need::EupMenu => "eupmenu.dll",
+        Need::HeapAdjuster => "heapadjuster.asi",
+        Need::PackfileAdjuster => "packfilelimitadjusterenhanced.asi",
     };
     plan.parts().flat_map(|p| &p.actions).any(|a| a.to().file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(file)))
 }

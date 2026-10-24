@@ -51,6 +51,21 @@ pub fn classify_bytes(bytes: &[u8]) -> Dll {
     }
 }
 
+/// The file version from a .dll or .asi's version resource, if it has one.
+pub fn file_version(path: &Path) -> Option<[u16; 4]> {
+    file_version_bytes(&std::fs::read(path).ok()?)
+}
+
+/// Finds VS_FIXEDFILEINFO by its signature; the version follows the
+/// signature and structure version.
+pub fn file_version_bytes(b: &[u8]) -> Option<[u16; 4]> {
+    let sig = 0xFEEF04BDu32.to_le_bytes();
+    let at = b.windows(4).position(|w| w == sig)?;
+    let u32_at = |o: usize| b.get(o..o + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]));
+    let (ms, ls) = (u32_at(at + 8)?, u32_at(at + 12)?);
+    Some([(ms >> 16) as u16, ms as u16, (ls >> 16) as u16, ls as u16])
+}
+
 /// True for a PE file with a CLR header.
 fn is_dotnet(b: &[u8]) -> bool {
     let u16_at = |o: usize| b.get(o..o + 2).map(|s| u16::from_le_bytes([s[0], s[1]]));
@@ -73,7 +88,7 @@ fn is_dotnet(b: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     /// A minimal PE32 image with a CLR header and the given metadata strings.
@@ -91,6 +106,30 @@ mod tests {
             b.push(0);
         }
         b
+    }
+
+    /// A version resource's fixed part with this version.
+    pub fn versioned(v: [u16; 4]) -> Vec<u8> {
+        let mut b = b"MZ padding ".to_vec();
+        b.extend_from_slice(&0xFEEF04BDu32.to_le_bytes());
+        b.extend_from_slice(&0x10000u32.to_le_bytes());
+        b.extend_from_slice(&(((v[0] as u32) << 16) | v[1] as u32).to_le_bytes());
+        b.extend_from_slice(&(((v[2] as u32) << 16) | v[3] as u32).to_le_bytes());
+        b
+    }
+
+    #[test]
+    #[ignore]
+    fn reads_this_pc_s_ragenativeui_version() {
+        let game = crate::game::find().expect("GTA V");
+        println!("{:?}", file_version(&game.join("RAGENativeUI.dll")));
+        assert!(file_version(&game.join("RAGENativeUI.dll")).is_some());
+    }
+
+    #[test]
+    fn reads_file_versions() {
+        assert_eq!(file_version_bytes(&versioned([1, 9, 3, 0])), Some([1, 9, 3, 0]));
+        assert_eq!(file_version_bytes(b"MZ no version"), None);
     }
 
     #[test]
